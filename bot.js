@@ -15,6 +15,22 @@ if (!TELEGRAM_BOT_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
+// -------------------- CONSTANTS --------------------
+const SITE_URL = "https://meme-streak-hub.lovable.app";
+const BROADCAST_INTERVAL_MS = 48 * 60 * 60 * 1000; // every 48h
+
+// Random promo messages for broadcasts
+const PROMO_MESSAGES = [
+  "🤣 New memes just dropped… ready to laugh again?",
+  "😂 Need a quick laugh break? I’ve got fresh memes for you!",
+  "🔥 Your MemeStreak is hungry… go feed it with new memes!",
+  "😈 I bet today’s memes will make you snort-laugh. Prove me wrong.",
+  "📲 Scroll less, laugh more. New memes waiting for you!",
+  "🤯 Some memes are SO dumb they’re genius. Go see for yourself.",
+  "🙃 Bored? I have memes. You know what to do.",
+  "😹 Warning: today’s memes may cause uncontrollable giggles.",
+];
+
 // -------------------- INIT --------------------
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -81,6 +97,11 @@ function logError(ctx, err) {
   console.error(`${ctx} error:`, err);
 }
 
+function randomPromoText() {
+  const i = Math.floor(Math.random() * PROMO_MESSAGES.length);
+  return PROMO_MESSAGES[i];
+}
+
 // streak logic: max +1 per day, reset if gap > 1 day
 function calculateNewStreak(existingStreak, lastMemeAtISO, nowISO) {
   const current = typeof existingStreak === "number" ? existingStreak : 0;
@@ -102,6 +123,15 @@ function calculateNewStreak(existingStreak, lastMemeAtISO, nowISO) {
   if (diffDays === 0) return current || 1; // same day, keep streak
   if (diffDays === 1) return current + 1; // next day
   return 1; // missed at least 1 full day
+}
+
+// Helper: send site button
+function sendSiteButton(chatId, text) {
+  return bot.sendMessage(chatId, text, {
+    reply_markup: {
+      inline_keyboard: [[{ text: "Open MemeStreak Hub 🌐", url: SITE_URL }]],
+    },
+  });
 }
 
 // -------------------- SUPABASE HELPERS --------------------
@@ -266,13 +296,13 @@ async function bumpStreak(senderUid, receiverUid) {
   }
 }
 
-// Log reactions (optional table "reactions")
+// Log reactions (table "reactions" with meme_message column)
 async function saveReaction(senderUid, receiverUid, memeMessageId, emoji) {
   try {
     const { error } = await supabase.from("reactions").insert({
       sender_uid: senderUid,
       receiver_uid: receiverUid,
-      meme_message_id: memeMessageId,
+      meme_message: String(memeMessageId),
       reaction: emoji,
     });
     if (error) throw error;
@@ -280,6 +310,52 @@ async function saveReaction(senderUid, receiverUid, memeMessageId, emoji) {
     logError("saveReaction", err);
   }
 }
+
+// -------------------- BROADCAST JOB (every 48h) --------------------
+async function broadcastPromoToAllUsers() {
+  try {
+    console.log("📣 Running promo broadcast job…");
+
+    const { data: users, error } = await supabase
+      .from("users")
+      .select("tg_user_id")
+      .not("tg_user_id", "is", null);
+
+    if (error) {
+      logError("broadcastPromoToAllUsers select", error);
+      return;
+    }
+
+    if (!users || !users.length) {
+      console.log("📣 No users found for promo.");
+      return;
+    }
+
+    for (const u of users) {
+      const chatId = Number(u.tg_user_id);
+      const text = `${randomPromoText()}\n\nTap below to open MemeStreak Hub 👇`;
+
+      await sendSiteButton(chatId, text).catch((err) => {
+        if (err.response && err.response.statusCode === 403) {
+          console.log(`User ${chatId} blocked the bot, skipping.`);
+        } else {
+          logError("broadcast send", err);
+        }
+      });
+
+      // tiny delay to avoid hitting Telegram rate limits
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
+    console.log("📣 Promo broadcast finished.");
+  } catch (err) {
+    logError("broadcastPromoToAllUsers", err);
+  }
+}
+
+// Run once after startup, then every 48h
+setTimeout(broadcastPromoToAllUsers, 15_000); // first run ~15s after start
+setInterval(broadcastPromoToAllUsers, BROADCAST_INTERVAL_MS);
 
 // -------------------- COMMANDS --------------------
 
@@ -293,7 +369,7 @@ bot.onText(/\/start/, async (msg) => {
     pendingSendTarget.delete(msg.from.id);
 
     const text =
-      "🔥 *Welcome to MemeStreak!*\n\n" +
+      "🔥 *Welcome to MemeStreak!* \n\n" +
       `Your UID: *${user.uid}*\n\n` +
       "Share memes every day to keep your streak alive! 🔥\n\n" +
       "Commands:\n" +
@@ -301,7 +377,7 @@ bot.onText(/\/start/, async (msg) => {
       "• /addfriend – Add a friend using their UID\n" +
       "• /friends – See your friend list & streaks\n" +
       "• /sendmeme – Send a meme to a friend\n" +
-      "• /site – Open meme website";
+      "• /opensite – Open MemeStreak Hub";
 
     await bot.sendMessage(chatId, text, { parse_mode: "Markdown" });
   } catch (err) {
@@ -324,18 +400,12 @@ bot.onText(/\/myuid/, async (msg) => {
   }
 });
 
-// /site
-bot.onText(/\/site/, async (msg) => {
+// /opensite  (new command using your site)
+bot.onText(/\/opensite/, async (msg) => {
   const chatId = msg.chat.id;
-  const url = "https://www.memedroid.com"; // temporary source
-  await bot.sendMessage(
+  await sendSiteButton(
     chatId,
-    "🌐 Tap below to open meme site, download a meme, then come back and send it via /sendmeme:",
-    {
-      reply_markup: {
-        inline_keyboard: [[{ text: "Open Meme Site", url }]],
-      },
-    }
+    "🌐 Tap below to open *MemeStreak Hub* and explore fresh memes:"
   );
 });
 
@@ -628,19 +698,18 @@ async function handleIncomingMeme(msg, type) {
     };
 
     // send meme to friend
-    let sent;
     if (type === "photo") {
-      sent = await bot.sendPhoto(receiverChatId, fileId, {
+      await bot.sendPhoto(receiverChatId, fileId, {
         caption,
         reply_markup: reactionKeyboard,
       });
     } else if (type === "video") {
-      sent = await bot.sendVideo(receiverChatId, fileId, {
+      await bot.sendVideo(receiverChatId, fileId, {
         caption,
         reply_markup: reactionKeyboard,
       });
     } else if (type === "document") {
-      sent = await bot.sendDocument(receiverChatId, fileId, {
+      await bot.sendDocument(receiverChatId, fileId, {
         caption,
         reply_markup: reactionKeyboard,
       });
@@ -655,9 +724,6 @@ async function handleIncomingMeme(msg, type) {
     );
 
     pendingSendTarget.delete(senderTgId);
-
-    // Optionally save initial "no reaction yet" using sent.message_id if you want
-    // const memeMessageId = sent.message_id;
   } catch (err) {
     logError("handleIncomingMeme", err);
     bot.sendMessage(
