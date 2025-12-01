@@ -4,11 +4,13 @@ require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const { createClient } = require("@supabase/supabase-js");
 const express = require("express");
+const jwt = require("jsonwebtoken");
 
 // -------------------- ENV --------------------
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const JWT_SECRET = process.env.JWT_SECRET || "MEMESTREAK_SUPER_SECRET";
 
 if (!TELEGRAM_BOT_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ Missing TELEGRAM_BOT_TOKEN / SUPABASE_URL / SUPABASE_KEY");
@@ -45,7 +47,92 @@ bot.on("polling_error", (err) => {
 const app = express();
 app.use(express.json());
 
-// POST /sendCode  { uid, code }  -> send login code to user on Telegram
+/***********************************************************
+ * NEW ROUTE: POST /verifyUID
+ * Body: { uid }
+ * Returns: { valid: true/false }
+ ***********************************************************/
+app.post("/verifyUID", async (req, res) => {
+  try {
+    const { uid } = req.body;
+    if (!uid) return res.json({ valid: false });
+
+    const { data, error } = await supabase
+      .from("users")
+      .select("uid")
+      .eq("uid", uid)
+      .maybeSingle();
+
+    if (error || !data) return res.json({ valid: false });
+    return res.json({ valid: true });
+  } catch (err) {
+    console.error("verifyUID error:", err);
+    return res.status(500).json({ valid: false });
+  }
+});
+
+/***********************************************************
+ * NEW ROUTE: POST /verifyOTP
+ * Body: { uid, otp }
+ * Verifies OTP (latest row in login_otps) and returns token
+ * Returns: { valid: true, token } or { valid: false }
+ ***********************************************************/
+app.post("/verifyOTP", async (req, res) => {
+  try {
+    const { uid, otp } = req.body;
+    if (!uid || !otp) return res.json({ valid: false });
+
+    const { data: row, error } = await supabase
+      .from("login_otps")
+      .select("*")
+      .eq("uid", uid)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !row) {
+      console.error("verifyOTP lookup error:", error);
+      return res.json({ valid: false });
+    }
+
+    if (String(row.otp) !== String(otp)) {
+      return res.json({ valid: false });
+    }
+
+    // OTP valid — generate JWT token (1 year)
+    const token = jwt.sign({ uid }, JWT_SECRET, { expiresIn: "365d" });
+
+    return res.json({ valid: true, token });
+  } catch (err) {
+    console.error("verifyOTP error:", err);
+    return res.status(500).json({ valid: false });
+  }
+});
+
+/***********************************************************
+ * NEW ROUTE: POST /autoLogin
+ * Body: { token }
+ * Returns: { loggedIn: true, uid } or { loggedIn: false }
+ ***********************************************************/
+app.post("/autoLogin", async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.json({ loggedIn: false });
+
+    try {
+      const data = jwt.verify(token, JWT_SECRET);
+      return res.json({ loggedIn: true, uid: data.uid });
+    } catch (err) {
+      return res.json({ loggedIn: false });
+    }
+  } catch (err) {
+    console.error("autoLogin error:", err);
+    return res.status(500).json({ loggedIn: false });
+  }
+});
+
+// -------------------- EXISTING: POST /sendCode  { uid, code }  -> send login code to user on Telegram
+// Modified to store OTP in login_otps table
 app.post("/sendCode", async (req, res) => {
   try {
     const { uid, code } = req.body;
@@ -62,6 +149,17 @@ app.post("/sendCode", async (req, res) => {
     if (error || !user) {
       console.error("sendCode user lookup error:", error);
       return res.status(404).json({ error: "User not found" });
+    }
+
+    // Store OTP in Supabase table `login_otps`
+    try {
+      await supabase.from("login_otps").insert({
+        uid,
+        otp: String(code),
+      });
+    } catch (dbErr) {
+      console.error("sendCode: failed to insert OTP row:", dbErr);
+      // continue — we still attempt to send the message
     }
 
     await bot
@@ -85,6 +183,7 @@ app.post("/sendCode", async (req, res) => {
   }
 });
 
+// Express listen
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🌐 Express API is live on port", PORT));
 
