@@ -1,4 +1,5 @@
-// bot.js
+// ==================== PART 1 OF 2 ====================
+// bot.js (PART 1) - Paste this as the start of your bot.js file
 
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
@@ -18,7 +19,7 @@ if (!TELEGRAM_BOT_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
 }
 
 // -------------------- CONSTANTS --------------------
-const SITE_URL = "https://meme-streak-hub.lovable.app";
+const SITE_URL = process.env.SITE_URL || "https://meme-streak-hub.lovable.app";
 const BROADCAST_INTERVAL_MS = 48 * 60 * 60 * 1000; // every 48h
 
 // Random promo messages for broadcasts
@@ -40,15 +41,33 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 console.log("🚀 MemeStreak Bot Running...");
 
 bot.on("polling_error", (err) => {
-  console.log("Polling error:", err.code, err.message);
+  console.log("Polling error:", err && err.code, err && err.message);
 });
 
 // -------------------- EXPRESS API (Website → Bot) --------------------
 const app = express();
 app.use(express.json());
 
+// === CORS middleware - allow frontend hosted anywhere to call these APIs ===
+app.use((req, res, next) => {
+  // You can tighten Access-Control-Allow-Origin to your domain if you want:
+  // res.header("Access-Control-Allow-Origin", "https://your-frontend.example.com");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
+// -------------------- TEMP/DB for OTP --------------------
+// We'll prefer Supabase storage of OTPs (login_otps table), but also keep an in-memory fallback
+const otpStore = {}; // { uid: { otp: '123456', createdAt: Date.now() } }
+// When you deploy on multiple instances, in-memory store won't persist — using Supabase is preferred.
+
+// -------------------- API ROUTES --------------------
+
 /***********************************************************
- * NEW ROUTE: POST /verifyUID
+ * POST /verifyUID
  * Body: { uid }
  * Returns: { valid: true/false }
  ***********************************************************/
@@ -72,37 +91,104 @@ app.post("/verifyUID", async (req, res) => {
 });
 
 /***********************************************************
- * NEW ROUTE: POST /verifyOTP
+ * POST /sendCode
+ * Body: { uid, code }
+ * Sends OTP to user's Telegram and stores it in Supabase (and fallback in memory)
+ ***********************************************************/
+app.post("/sendCode", async (req, res) => {
+  try {
+    const { uid, code } = req.body;
+    if (!uid || !code) {
+      return res.status(400).json({ error: "uid and code required" });
+    }
+
+    // Lookup user tg_user_id
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("tg_user_id")
+      .eq("uid", uid)
+      .maybeSingle();
+
+    if (error || !user) {
+      console.error("sendCode user lookup error:", error);
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Store OTP in Supabase login_otps table (preferred)
+    try {
+      await supabase.from("login_otps").insert({
+        uid,
+        otp: String(code),
+      });
+    } catch (dbErr) {
+      console.error("sendCode: failed to insert OTP row in Supabase:", dbErr);
+      // fallback: store in-memory for short-lived use
+      otpStore[uid] = { otp: String(code), createdAt: Date.now() };
+    }
+
+    // Send OTP to user's Telegram (best-effort)
+    try {
+      await bot.sendMessage(
+        user.tg_user_id,
+        `🔐 Your MemeStreak login code:\n\n⭐ *${code}*`,
+        { parse_mode: "Markdown" }
+      );
+    } catch (err) {
+      if (err.response && err.response.statusCode === 403) {
+        console.log("User blocked bot while sending login code.");
+      } else {
+        console.error("sendCode sendMessage error:", err);
+      }
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("sendCode error:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
+
+/***********************************************************
+ * POST /verifyOTP
  * Body: { uid, otp }
- * Verifies OTP (latest row in login_otps) and returns token
- * Returns: { valid: true, token } or { valid: false }
+ * Verifies OTP (prefers Supabase login_otps latest row), returns JWT token on success.
  ***********************************************************/
 app.post("/verifyOTP", async (req, res) => {
   try {
     const { uid, otp } = req.body;
     if (!uid || !otp) return res.json({ valid: false });
 
-    const { data: row, error } = await supabase
-      .from("login_otps")
-      .select("*")
-      .eq("uid", uid)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // First, try Supabase login_otps table (latest entry)
+    try {
+      const { data: row, error } = await supabase
+        .from("login_otps")
+        .select("*")
+        .eq("uid", uid)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-    if (error || !row) {
-      console.error("verifyOTP lookup error:", error);
-      return res.json({ valid: false });
+      if (!error && row && String(row.otp) === String(otp)) {
+        // OTP matches Supabase row
+        // Optionally: delete old OTP rows or keep them for audit
+        const token = jwt.sign({ uid }, JWT_SECRET, { expiresIn: "365d" });
+        return res.json({ valid: true, token });
+      }
+    } catch (dbErr) {
+      console.error("verifyOTP Supabase lookup error:", dbErr);
     }
 
-    if (String(row.otp) !== String(otp)) {
-      return res.json({ valid: false });
+    // Fallback: check in-memory otpStore
+    const mem = otpStore[uid];
+    if (mem && String(mem.otp) === String(otp)) {
+      // delete in-memory OTP after use
+      delete otpStore[uid];
+      const token = jwt.sign({ uid }, JWT_SECRET, { expiresIn: "365d" });
+      return res.json({ valid: true, token });
     }
 
-    // OTP valid — generate JWT token (1 year)
-    const token = jwt.sign({ uid }, JWT_SECRET, { expiresIn: "365d" });
-
-    return res.json({ valid: true, token });
+    // Not matched
+    return res.json({ valid: false });
   } catch (err) {
     console.error("verifyOTP error:", err);
     return res.status(500).json({ valid: false });
@@ -110,9 +196,9 @@ app.post("/verifyOTP", async (req, res) => {
 });
 
 /***********************************************************
- * NEW ROUTE: POST /autoLogin
+ * POST /autoLogin
  * Body: { token }
- * Returns: { loggedIn: true, uid } or { loggedIn: false }
+ * Verifies JWT token and returns loggedIn status and uid
  ***********************************************************/
 app.post("/autoLogin", async (req, res) => {
   try {
@@ -131,59 +217,7 @@ app.post("/autoLogin", async (req, res) => {
   }
 });
 
-// -------------------- EXISTING: POST /sendCode  { uid, code }  -> send login code to user on Telegram
-// Modified to store OTP in login_otps table
-app.post("/sendCode", async (req, res) => {
-  try {
-    const { uid, code } = req.body;
-    if (!uid || !code) {
-      return res.status(400).json({ error: "uid and code required" });
-    }
-
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("tg_user_id")
-      .eq("uid", uid)
-      .maybeSingle();
-
-    if (error || !user) {
-      console.error("sendCode user lookup error:", error);
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    // Store OTP in Supabase table `login_otps`
-    try {
-      await supabase.from("login_otps").insert({
-        uid,
-        otp: String(code),
-      });
-    } catch (dbErr) {
-      console.error("sendCode: failed to insert OTP row:", dbErr);
-      // continue — we still attempt to send the message
-    }
-
-    await bot
-      .sendMessage(
-        user.tg_user_id,
-        `🔐 Your MemeStreak login code:\n\n⭐ *${code}*`,
-        { parse_mode: "Markdown" }
-      )
-      .catch((err) => {
-        if (err.response && err.response.statusCode === 403) {
-          console.log("User blocked bot while sending login code.");
-        } else {
-          console.error("sendCode sendMessage error:", err);
-        }
-      });
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("sendCode error:", err);
-    return res.status(500).json({ error: "Internal error" });
-  }
-});
-
-// Express listen
+// Express listen (we keep this here in part 1; full file will remain consistent)
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("🌐 Express API is live on port", PORT));
 
@@ -315,6 +349,15 @@ async function getUsersByUids(uids) {
   }
 }
 
+// -------------------- PART 1 END --------------------
+// Paste PART 2 after this exact line to complete the file
+// ==================== END OF PART 1 OF 2 ====================
+
+
+// ==================== PART 2 OF 2 ====================
+// Continue from Part 1 — DO NOT remove any lines above.
+
+// -------------------- FRIEND RELATIONS --------------------
 async function addFriendRelation(userUid, friendUid) {
   try {
     if (userUid === friendUid) {
@@ -352,7 +395,7 @@ async function addFriendRelation(userUid, friendUid) {
   }
 }
 
-// streak update in friends table for both directions
+// -------------------- STREAK UPDATE --------------------
 async function bumpStreak(senderUid, receiverUid) {
   const now = new Date().toISOString();
 
@@ -395,7 +438,7 @@ async function bumpStreak(senderUid, receiverUid) {
   }
 }
 
-// Log reactions (table "reactions" with meme_message column)
+// -------------------- REACTIONS --------------------
 async function saveReaction(senderUid, receiverUid, memeMessageId, emoji) {
   try {
     const { error } = await supabase.from("reactions").insert({
@@ -410,7 +453,7 @@ async function saveReaction(senderUid, receiverUid, memeMessageId, emoji) {
   }
 }
 
-// -------------------- BROADCAST JOB (every 48h) --------------------
+// -------------------- BROADCAST JOB --------------------
 async function broadcastPromoToAllUsers() {
   try {
     console.log("📣 Running promo broadcast job…");
@@ -442,7 +485,6 @@ async function broadcastPromoToAllUsers() {
         }
       });
 
-      // tiny delay to avoid hitting Telegram rate limits
       await new Promise((r) => setTimeout(r, 150));
     }
 
@@ -452,8 +494,7 @@ async function broadcastPromoToAllUsers() {
   }
 }
 
-// Run once after startup, then every 48h
-setTimeout(broadcastPromoToAllUsers, 15_000); // first run ~15s after start
+setTimeout(broadcastPromoToAllUsers, 15_000);
 setInterval(broadcastPromoToAllUsers, BROADCAST_INTERVAL_MS);
 
 // -------------------- COMMANDS --------------------
@@ -499,7 +540,7 @@ bot.onText(/\/myuid/, async (msg) => {
   }
 });
 
-// /opensite  (new command using your site)
+// /opensite
 bot.onText(/\/opensite/, async (msg) => {
   const chatId = msg.chat.id;
   await sendSiteButton(
@@ -508,7 +549,7 @@ bot.onText(/\/opensite/, async (msg) => {
   );
 });
 
-// /addfriend -> ask for UID in next message
+// /addfriend
 bot.onText(/\/addfriend/, async (msg) => {
   const chatId = msg.chat.id;
   try {
@@ -560,7 +601,7 @@ bot.onText(/\/friends/, async (msg) => {
   }
 });
 
-// /sendmeme – choose friend with buttons
+// /sendmeme
 bot.onText(/\/sendmeme/, async (msg) => {
   const chatId = msg.chat.id;
   try {
@@ -599,9 +640,7 @@ bot.onText(/\/sendmeme/, async (msg) => {
     await bot.sendMessage(
       chatId,
       "📤 Who do you want to send a meme to?\nTap a friend:",
-      {
-        reply_markup: { inline_keyboard: buttons },
-      }
+      { reply_markup: { inline_keyboard: buttons } }
     );
   } catch (err) {
     logError("/sendmeme", err);
@@ -616,7 +655,7 @@ bot.on("callback_query", async (query) => {
     const from = query.from;
     const chatId = query.message.chat.id;
 
-    // Friend chosen
+    // Choosing a friend
     if (data.startsWith("pickfriend:")) {
       const friendUid = data.split(":")[1];
       pendingSendTarget.set(from.id, { friendUid });
@@ -634,21 +673,24 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
-    // Reaction button pressed
+    // Reaction pressed
     if (data.startsWith("react:")) {
       const parts = data.split(":"); // react:emoji:senderUid
       const emoji = parts[1];
       const originalSenderUid = parts[2];
 
-      const reactor = await ensureUser(from); // user who pressed reaction
+      const reactor = await ensureUser(from);
 
       const memeMsg = query.message;
       const memeMessageId = memeMsg.message_id;
 
-      // save reaction in DB
-      await saveReaction(reactor.uid, originalSenderUid, memeMessageId, emoji);
+      await saveReaction(
+        reactor.uid,
+        originalSenderUid,
+        memeMessageId,
+        emoji
+      );
 
-      // notify original sender (if they still allow bot)
       const originalSender = await getUserByUid(originalSenderUid);
       if (originalSender && originalSender.tg_user_id) {
         const reactorName =
@@ -679,10 +721,9 @@ bot.on("callback_query", async (query) => {
   }
 });
 
-// -------------------- MESSAGE HANDLER (for add_friend UID) --------------------
+// -------------------- MESSAGE HANDLER --------------------
 bot.on("message", async (msg) => {
   try {
-    // ignore messages that are pure commands
     if (msg.text && msg.text.startsWith("/")) return;
 
     const state = userStates.get(msg.from.id);
@@ -729,7 +770,7 @@ bot.on("message", async (msg) => {
   }
 });
 
-// -------------------- MEME HANDLERS --------------------
+// -------------------- MEME MEDIA HANDLERS --------------------
 bot.on("photo", (msg) => handleIncomingMeme(msg, "photo"));
 bot.on("video", (msg) => handleIncomingMeme(msg, "video"));
 bot.on("document", (msg) => handleIncomingMeme(msg, "document"));
@@ -739,10 +780,7 @@ async function handleIncomingMeme(msg, type) {
     const senderTgId = msg.from.id;
     const target = pendingSendTarget.get(senderTgId);
 
-    if (!target) {
-      // meme not part of /sendmeme flow → ignore streak logic
-      return;
-    }
+    if (!target) return;
 
     const senderUser = await ensureUser(msg.from);
     const senderUid = senderUser.uid;
@@ -761,7 +799,6 @@ async function handleIncomingMeme(msg, type) {
 
     const receiverChatId = Number(friendRow.tg_user_id);
 
-    // get file_id
     let fileId;
     if (type === "photo") {
       const photos = msg.photo || [];
@@ -771,7 +808,7 @@ async function handleIncomingMeme(msg, type) {
       if (!msg.video) return;
       fileId = msg.video.file_id;
     } else if (type === "document") {
-      if (!msg.document) return;
+      if (!msg.document) return; 
       fileId = msg.document.file_id;
     }
 
@@ -783,20 +820,18 @@ async function handleIncomingMeme(msg, type) {
 
     const caption = `📨 Meme from ${senderName}`;
 
-    const callbackBase = `react`; // react:emoji:senderUid
     const reactionKeyboard = {
       inline_keyboard: [
         [
-          { text: "😂", callback_data: `${callbackBase}:😂:${senderUid}` },
-          { text: "🤣", callback_data: `${callbackBase}:🤣:${senderUid}` },
-          { text: "😐", callback_data: `${callbackBase}:😐:${senderUid}` },
-          { text: "😭", callback_data: `${callbackBase}:😭:${senderUid}` },
-          { text: "❤️", callback_data: `${callbackBase}:❤️:${senderUid}` },
+          { text: "😂", callback_data: `react:😂:${senderUid}` },
+          { text: "🤣", callback_data: `react:🤣:${senderUid}` },
+          { text: "😐", callback_data: `react:😐:${senderUid}` },
+          { text: "😭", callback_data: `react:😭:${senderUid}` },
+          { text: "❤️", callback_data: `react:❤️:${senderUid}` },
         ],
       ],
     };
 
-    // send meme to friend
     if (type === "photo") {
       await bot.sendPhoto(receiverChatId, fileId, {
         caption,
@@ -814,7 +849,6 @@ async function handleIncomingMeme(msg, type) {
       });
     }
 
-    // update streak
     await bumpStreak(senderUid, friendUid);
 
     await bot.sendMessage(
@@ -831,3 +865,5 @@ async function handleIncomingMeme(msg, type) {
     );
   }
 }
+
+// ==================== END OF PART 2 OF 2 ====================
